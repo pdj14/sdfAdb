@@ -3,12 +3,22 @@
  * Wraps @devicefarmer/adbkit for easier use
  */
 
-const Adb = require('@devicefarmer/adbkit');
+const adbkit = require('@devicefarmer/adbkit');
 const chalk = require('chalk');
+
+// Handle different adbkit export formats
+const Adb = adbkit.Adb || adbkit.default || adbkit;
 
 class AdbClient {
     constructor() {
-        this.client = Adb.createClient();
+        // Try different ways to create client
+        if (typeof Adb.createClient === 'function') {
+            this.client = Adb.createClient();
+        } else if (typeof adbkit.createClient === 'function') {
+            this.client = adbkit.createClient();
+        } else {
+            throw new Error('Cannot find adbkit createClient function. Check adbkit version.');
+        }
     }
 
     /**

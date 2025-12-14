@@ -15,11 +15,18 @@
         "build:all": "npm run build:win && npm run build:linux && npm run build:macos"
     },
     "pkg": {
-        "scripts": "src/**/*.js",
+        "scripts": [
+            "src/**/*.js",
+            "bin/**/*.js"
+        ],
+        "assets": [
+            "node_modules/@devicefarmer/adbkit/**/*",
+            "node_modules/chalk/**/*",
+            "node_modules/ws/**/*"
+        ],
         "targets": [
             "node18-win-x64",
-            "node18-linux-x64",
-            "node18-macos-x64"
+            "node18-linux-x64"
         ],
         "outputPath": "dist"
     },

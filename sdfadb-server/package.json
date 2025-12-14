@@ -12,9 +12,17 @@
         "build:linux": "pkg . --targets node18-linux-x64 --output dist/sdfadb-server-linux"
     },
     "pkg": {
-        "scripts": "src/**/*.js",
+        "scripts": [
+            "src/**/*.js",
+            "bin/**/*.js"
+        ],
+        "assets": [
+            "node_modules/chalk/**/*",
+            "node_modules/ws/**/*"
+        ],
         "targets": [
-            "node18-linux-x64"
+            "node18-linux-x64",
+            "node18-win-x64"
         ],
         "outputPath": "dist"
     },
