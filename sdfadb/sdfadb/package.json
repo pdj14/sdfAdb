@@ -1,0 +1,50 @@
+{
+    "name": "sdfadb",
+    "version": "1.0.0",
+    "description": "ADB Remote Bridge - Share and access Android devices remotely",
+    "main": "src/index.js",
+    "bin": {
+        "sdfadb": "./bin/sdfadb.js"
+    },
+    "scripts": {
+        "start": "node bin/sdfadb.js",
+        "dev": "node --watch bin/sdfadb.js",
+        "build:win": "pkg . --targets node18-win-x64 --output dist/sdfadb-win.exe",
+        "build:linux": "pkg . --targets node18-linux-x64 --output dist/sdfadb-linux",
+        "build:macos": "pkg . --targets node18-macos-x64 --output dist/sdfadb-macos",
+        "build:all": "npm run build:win && npm run build:linux && npm run build:macos"
+    },
+    "pkg": {
+        "scripts": "src/**/*.js",
+        "targets": [
+            "node18-win-x64",
+            "node18-linux-x64",
+            "node18-macos-x64"
+        ],
+        "outputPath": "dist"
+    },
+    "keywords": [
+        "adb",
+        "android",
+        "remote",
+        "bridge",
+        "device-farm"
+    ],
+    "author": "sdfadb",
+    "license": "MIT",
+    "dependencies": {
+        "@devicefarmer/adbkit": "^3.2.6",
+        "commander": "^11.1.0",
+        "ws": "^8.14.2",
+        "chalk": "^4.1.2",
+        "cli-table3": "^0.6.3",
+        "ora": "^5.4.1",
+        "yaml": "^2.3.4"
+    },
+    "devDependencies": {
+        "@yao-pkg/pkg": "^5.11.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}

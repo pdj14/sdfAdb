@@ -1,0 +1,11 @@
+# Core
+adbutils>=2.0.0
+websockets>=12.0
+asyncio
+
+# CLI
+click>=8.0.0
+rich>=13.0.0
+
+# Utils
+pyyaml>=6.0

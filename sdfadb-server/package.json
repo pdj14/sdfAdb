@@ -1,0 +1,41 @@
+{
+    "name": "sdfadb-server",
+    "version": "1.0.0",
+    "description": "SDF ADB Relay Server for remote ADB device bridging",
+    "main": "src/index.js",
+    "bin": {
+        "sdfadb-server": "./bin/sdfadb-server.js"
+    },
+    "scripts": {
+        "start": "node bin/sdfadb-server.js",
+        "dev": "node --watch bin/sdfadb-server.js",
+        "build:linux": "pkg . --targets node18-linux-x64 --output dist/sdfadb-server-linux"
+    },
+    "pkg": {
+        "scripts": "src/**/*.js",
+        "targets": [
+            "node18-linux-x64"
+        ],
+        "outputPath": "dist"
+    },
+    "keywords": [
+        "adb",
+        "relay",
+        "server",
+        "device-farm"
+    ],
+    "author": "sdfadb",
+    "license": "MIT",
+    "dependencies": {
+        "commander": "^11.1.0",
+        "ws": "^8.14.2",
+        "chalk": "^4.1.2",
+        "cli-table3": "^0.6.3"
+    },
+    "devDependencies": {
+        "@yao-pkg/pkg": "^5.11.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
