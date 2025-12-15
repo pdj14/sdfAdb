@@ -53,8 +53,16 @@ class Provider {
             if (this.direct) {
                 console.log(chalk.yellow(`\n📡 Direct Mode`));
                 console.log(chalk.white(`   Listening on: 0.0.0.0:${this.directPort}`));
-                console.log(chalk.dim(`\nController can connect with:`));
-                console.log(chalk.white(`   sdfadb connect --direct <your-ip>:${this.directPort} --device <serial> --port 5555`));
+
+                // Explain standard ADB usage if applicable
+                if (this.deviceFilter && this.deviceFilter.length === 1) {
+                    console.log(chalk.green(`\n✨ Standard ADB Client Supported!`));
+                    console.log(chalk.white(`   You can connect directly with:`));
+                    console.log(chalk.white(`   adb connect <your-ip>:${this.directPort}`));
+                } else {
+                    console.log(chalk.dim(`\nController can connect with:`));
+                    console.log(chalk.white(`   sdfadb connect --direct <your-ip>:${this.directPort} --device <serial> --port 5555`));
+                }
             }
 
             console.log(chalk.dim('\nWaiting for connections... (Ctrl+C to stop)'));
@@ -74,74 +82,48 @@ class Provider {
             this.directServer = net.createServer(async (socket) => {
                 console.log(chalk.cyan(`\nDirect connection from ${socket.remoteAddress}`));
 
-                // Protocol: first message is JSON with device serial
-                socket.once('data', async (data) => {
-                    try {
-                        const request = JSON.parse(data.toString());
-                        const { deviceSerial } = request;
+                // If a specific device is forced via CLI (this.deviceFilter has 1 item), use it directly
+                // allowing standard `adb connect provider:ip` without handshake
+                let forceDevice = null;
+                if (this.deviceFilter && this.deviceFilter.length === 1) {
+                    forceDevice = this.deviceFilter[0];
+                }
 
-                        console.log(chalk.dim(`  Requested device: ${deviceSerial}`));
-
-                        // Verify device exists
-                        const devices = await this.getDevices();
-                        const device = devices.find(d => d.serial === deviceSerial);
-
-                        if (!device) {
-                            socket.write(JSON.stringify({ success: false, error: 'Device not found' }));
-                            socket.end();
-                            return;
-                        }
-
-                        // Enable TCP mode on device
+                if (forceDevice) {
+                    console.log(chalk.dim(`  Auto-bridging to forced device: ${forceDevice}`));
+                    this.bridgeToDevice(socket, forceDevice);
+                } else {
+                    // Protocol: wait for JSON handshake
+                    socket.once('data', async (data) => {
                         try {
-                            await this.adb.tcpip(deviceSerial, 5555);
-                            await new Promise(r => setTimeout(r, 1000)); // Wait for device
-                        } catch (e) {
-                            // May already be in TCP mode
-                        }
+                            // Try to parse as JSON handshake
+                            const request = JSON.parse(data.toString());
+                            const { deviceSerial } = request;
 
-                        // Send success response
-                        socket.write(JSON.stringify({
-                            success: true,
-                            device: {
-                                serial: device.serial,
-                                model: device.model
+                            // Verify device exists
+                            const devices = await this.getDevices();
+                            const device = devices.find(d => d.serial === deviceSerial);
+
+                            if (!device) {
+                                socket.write(JSON.stringify({ success: false, error: 'Device not found' }));
+                                socket.end();
+                                return;
                             }
-                        }));
 
-                        // Now bridge this socket to local ADB
-                        // Connect to local ADB server
-                        const adbConn = net.createConnection({ port: 5037 }, () => {
-                            console.log(chalk.green(`  ✓ Bridge established for ${deviceSerial}`));
+                            // Send success response
+                            socket.write(JSON.stringify({
+                                success: true,
+                                device: { serial: device.serial, model: device.model }
+                            }));
 
-                            // Forward ADB host command to select device
-                            const hostCmd = `host:transport:${deviceSerial}`;
-                            const cmdLen = hostCmd.length.toString(16).padStart(4, '0');
-                            adbConn.write(`${cmdLen}${hostCmd}`);
-                        });
+                            this.bridgeToDevice(socket, deviceSerial);
 
-                        // Bridge data
-                        socket.pipe(adbConn);
-                        adbConn.pipe(socket);
-
-                        this.directConnections.set(socket, { deviceSerial, adbConn });
-
-                        socket.on('close', () => {
-                            console.log(chalk.yellow(`  Connection closed for ${deviceSerial}`));
-                            adbConn.end();
-                            this.directConnections.delete(socket);
-                        });
-
-                        socket.on('error', () => {
-                            adbConn.end();
-                            this.directConnections.delete(socket);
-                        });
-
-                    } catch (error) {
-                        console.error(chalk.red('  Invalid request:', error.message));
-                        socket.end();
-                    }
-                });
+                        } catch (e) {
+                            console.error(chalk.red('  Invalid handshake and no default device selected.'));
+                            socket.end();
+                        }
+                    });
+                }
             });
 
             this.directServer.on('error', reject);
@@ -150,6 +132,45 @@ class Provider {
                 resolve();
             });
         });
+    }
+
+    async bridgeToDevice(socket, deviceSerial) {
+        try {
+            // Enable TCP mode on device (just in case)
+            try {
+                await this.adb.tcpip(deviceSerial, 5555);
+            } catch (e) { }
+
+            // Connect to local ADB server
+            const adbConn = net.createConnection({ port: 5037 }, () => {
+                console.log(chalk.green(`  ✓ Bridge established for ${deviceSerial}`));
+
+                // Forward ADB host command to select device
+                const hostCmd = `host:transport:${deviceSerial}`;
+                const cmdLen = hostCmd.length.toString(16).padStart(4, '0');
+                adbConn.write(`${cmdLen}${hostCmd}`);
+            });
+
+            // Bridge data
+            socket.pipe(adbConn);
+            adbConn.pipe(socket);
+
+            this.directConnections.set(socket, { deviceSerial, adbConn });
+
+            socket.on('close', () => {
+                console.log(chalk.yellow(`  Connection closed for ${deviceSerial}`));
+                adbConn.end();
+                this.directConnections.delete(socket);
+            });
+
+            socket.on('error', () => {
+                adbConn.end();
+                this.directConnections.delete(socket);
+            });
+        } catch (error) {
+            console.error(chalk.red(`Bridge error: ${error.message}`));
+            socket.end();
+        }
     }
 
     async connectRelay() {
@@ -277,7 +298,13 @@ class Provider {
 
         // Bridge to local ADB daemon
         const adbPort = 5037; // Local ADB server port
-        const adbConn = net.createConnection({ port: adbPort });
+        const adbConn = net.createConnection({ port: adbPort }, () => {
+            // CRITICAL FIX: Switch local ADB connection to transport mode for this device
+            // This makes the tunnel transparency bridge to the specific device
+            const hostCmd = `host:transport:${deviceSerial}`;
+            const cmdLen = hostCmd.length.toString(16).padStart(4, '0');
+            adbConn.write(`${cmdLen}${hostCmd}`);
+        });
 
         tunnel.pipe(adbConn);
         adbConn.pipe(tunnel);
