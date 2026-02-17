@@ -4,12 +4,27 @@
  */
 
 const { program } = require('commander');
+const fs = require('fs');
 const pkg = require('../package.json');
 
 // Import commands
 const { provide } = require('../src/provider');
 const { connect, disconnect, list } = require('../src/controller');
 const { startRelay } = require('../src/relay/server');
+
+function readConfigFile(configPath) {
+    if (!configPath) {
+        return {};
+    }
+
+    try {
+        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (error) {
+        console.error(`Invalid config file: ${error.message}`);
+        process.exit(1);
+    }
+}
+
 
 program
     .name('sdfadb')
@@ -20,14 +35,23 @@ program
 program
     .command('relay')
     .description('Start relay server for NAT traversal')
+    .option('-c, --config <path>', 'Relay config json path')
     .option('-p, --port <port>', 'Signal server port', '21120')
     .option('--port-start <port>', 'Port pool start', '30001')
     .option('--port-end <port>', 'Port pool end', '30999')
+    .option('--half-open-timeout <ms>', 'Half-open timeout in ms', '15000')
+    .option('--idle-timeout <ms>', 'Idle timeout in ms', '300000')
+    .option('--max-sessions <count>', 'Max active sessions', '100')
     .action((options) => {
+        const cfg = readConfigFile(options.config);
         startRelay({
-            port: parseInt(options.port),
-            portStart: parseInt(options.portStart),
-            portEnd: parseInt(options.portEnd)
+            host: cfg.host,
+            port: options.port ? parseInt(options.port) : cfg.port,
+            portStart: options.portStart ? parseInt(options.portStart) : cfg.portStart,
+            portEnd: options.portEnd ? parseInt(options.portEnd) : cfg.portEnd,
+            halfOpenTimeoutMs: options.halfOpenTimeout ? parseInt(options.halfOpenTimeout) : cfg.halfOpenTimeoutMs,
+            idleTimeoutMs: options.idleTimeout ? parseInt(options.idleTimeout) : cfg.idleTimeoutMs,
+            maxSessions: options.maxSessions ? parseInt(options.maxSessions) : cfg.maxSessions
         });
     });
 

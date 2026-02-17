@@ -15,6 +15,13 @@ class RelayServer {
         this.providers = new Map(); // providerId -> { ws, devices }
         this.controllers = new Map(); // controllerId -> ws
         this.tunnels = new Map(); // port -> { provider, controller, connections }
+        this.activeDeviceSessions = new Map(); // providerId:serial -> sessionId
+        this.halfOpenTimeoutMs = options.halfOpenTimeoutMs || 15000;
+        this.idleTimeoutMs = options.idleTimeoutMs || 300000;
+        this.metrics = {
+            connectFailures: 0
+        };
+        this.maxSessions = options.maxSessions || 100;
     }
 
     start() {
@@ -54,14 +61,53 @@ class RelayServer {
                 this.updateProviderDevices(msg);
                 break;
             case 'list_devices':
-                this.listDevices(ws);
+                this.listDevices(ws, msg);
                 break;
             case 'connect_device':
                 this.connectDevice(ws, msg);
                 break;
+            case 'disconnect_device':
+                this.disconnectDevice(ws, msg);
+                break;
+            case 'status':
+                this.sendStatus(ws, msg);
+                break;
             default:
                 console.log(chalk.dim(`Unknown message type: ${msg.type}`));
         }
+    }
+
+    buildError(code, message, retryable = false) {
+        this.metrics.connectFailures += 1;
+        return {
+            success: false,
+            error: message,
+            errorCode: code,
+            retryable
+        };
+    }
+
+    sessionEvent(event, details = {}) {
+        console.log(chalk.dim(`[SESSION] ${event} ${JSON.stringify(details)}`));
+    }
+
+    getObservabilitySnapshot() {
+        let halfOpenSessions = 0;
+
+        for (const [, tunnel] of this.tunnels) {
+            const connectedCount = (tunnel.controllerSocket ? 1 : 0) + (tunnel.providerSocket ? 1 : 0);
+            if (connectedCount < 2) {
+                halfOpenSessions += 1;
+            }
+        }
+
+        const stats = this.portPool.getStats();
+        return {
+            active_sessions: this.activeDeviceSessions.size,
+            half_open_sessions: halfOpenSessions,
+            port_pool_usage: stats.allocated,
+            connect_failures: this.metrics.connectFailures
+        };
     }
 
     registerProvider(ws, msg, clientIp) {
@@ -80,7 +126,8 @@ class RelayServer {
 
         ws.send(JSON.stringify({
             type: 'registered',
-            providerId
+            providerId,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -94,7 +141,7 @@ class RelayServer {
         }
     }
 
-    listDevices(ws) {
+    listDevices(ws, msg = {}) {
         const devices = [];
 
         for (const [providerId, provider] of this.providers) {
@@ -108,7 +155,8 @@ class RelayServer {
 
         ws.send(JSON.stringify({
             type: 'device_list',
-            devices
+            devices,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -119,19 +167,40 @@ class RelayServer {
         if (!provider) {
             ws.send(JSON.stringify({
                 type: 'connect_response',
-                success: false,
-                error: 'Provider not found'
+                ...this.buildError('PROVIDER_NOT_FOUND', 'Provider not found', false),
+                requestId: msg.requestId || null
             }));
             return;
         }
+        if (this.tunnels.size >= this.maxSessions) {
+            ws.send(JSON.stringify({
+                type: 'connect_response',
+                ...this.buildError('SESSION_LIMIT_REACHED', 'Max sessions reached', true),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
 
         // Allocate port for this connection
         const port = this.portPool.allocate(providerId, deviceSerial);
         if (!port) {
             ws.send(JSON.stringify({
                 type: 'connect_response',
-                success: false,
-                error: 'No ports available'
+                ...this.buildError('PORT_EXHAUSTED', 'No ports available', true),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
+        const sessionId = `${controllerId}-${deviceSerial}-${Date.now()}`;
+
+        if (!this.reserveDeviceSession(providerId, deviceSerial, sessionId)) {
+            this.portPool.release(port);
+            ws.send(JSON.stringify({
+                type: 'connect_response',
+                ...this.buildError('DEVICE_BUSY', 'Device already in use', false),
+                requestId: msg.requestId || null
             }));
             return;
         }
@@ -139,7 +208,7 @@ class RelayServer {
         console.log(chalk.cyan(`Connection: ${controllerId} → ${providerId}/${deviceSerial} (port ${port})`));
 
         // Create TCP bridge server
-        this.createBridge(port, providerId, deviceSerial, ws, provider.ws);
+        this.createBridge(port, sessionId, providerId, deviceSerial, ws, provider.ws);
 
         // Notify provider to connect
         provider.ws.send(JSON.stringify({
@@ -149,15 +218,73 @@ class RelayServer {
             relayPort: port
         }));
 
+        this.sessionEvent('connect_allocated', { sessionId, providerId, deviceSerial, relayPort: port });
+
         // Respond to controller
         ws.send(JSON.stringify({
             type: 'connect_response',
             success: true,
-            relayPort: port
+            relayPort: port,
+            sessionId,
+            requestId: msg.requestId || null
         }));
     }
 
-    createBridge(port, providerId, deviceSerial, controllerWs, providerWs) {
+    disconnectDevice(ws, msg) {
+        const { sessionId, relayPort } = msg;
+
+        let targetPort = relayPort;
+
+        if (!targetPort && sessionId) {
+            for (const [port, tunnel] of this.tunnels) {
+                if (tunnel.sessionId === sessionId) {
+                    targetPort = port;
+                    break;
+                }
+            }
+        }
+
+        if (!targetPort || !this.tunnels.has(targetPort)) {
+            ws.send(JSON.stringify({
+                type: 'disconnect_response',
+                ...this.buildError('SESSION_NOT_FOUND', 'Session not found', false),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
+        const tunnel = this.tunnels.get(targetPort);
+
+        if (tunnel.providerSocket) {
+            tunnel.providerSocket.end();
+        }
+
+        if (tunnel.controllerSocket) {
+            tunnel.controllerSocket.end();
+        }
+
+        if (this.providers.has(tunnel.providerId)) {
+            const providerWs = this.providers.get(tunnel.providerId).ws;
+            if (providerWs && providerWs.readyState === WebSocket.OPEN) {
+                providerWs.send(JSON.stringify({
+                    type: 'disconnect_request',
+                    relayPort: targetPort
+                }));
+            }
+        }
+
+        this.releaseTunnel(targetPort, 'disconnect-request');
+
+        ws.send(JSON.stringify({
+            type: 'disconnect_response',
+            success: true,
+            relayPort: targetPort,
+            sessionId: tunnel.sessionId,
+            requestId: msg.requestId || null
+        }));
+    }
+
+    createBridge(port, sessionId, providerId, deviceSerial, controllerWs, providerWs) {
         const server = net.createServer((socket) => {
             // Store socket for bridging
             const tunnel = this.tunnels.get(port);
@@ -165,6 +292,17 @@ class RelayServer {
                 if (!tunnel.controllerSocket) {
                     tunnel.controllerSocket = socket;
                     console.log(chalk.dim(`Controller connected to bridge port ${port}`));
+
+                    socket.on('close', () => {
+                        const latest = this.tunnels.get(port);
+                        if (!latest) {
+                            return;
+                        }
+                        latest.controllerSocket = null;
+                        if (!latest.providerSocket) {
+                            this.releaseTunnel(port, 'controller-disconnected-before-bridge');
+                        }
+                    });
                 } else {
                     // This is provider connecting
                     tunnel.providerSocket = socket;
@@ -173,7 +311,29 @@ class RelayServer {
                     // Bridge the two sockets
                     tunnel.controllerSocket.pipe(tunnel.providerSocket);
                     tunnel.providerSocket.pipe(tunnel.controllerSocket);
+
+                    if (tunnel.halfOpenTimer) {
+                        clearTimeout(tunnel.halfOpenTimer);
+                        tunnel.halfOpenTimer = null;
+                    }
+
+                    this.bindIdleTracking(port, tunnel.controllerSocket);
+                    this.bindIdleTracking(port, tunnel.providerSocket);
+                    this.armIdleTimeout(port);
+
+                    socket.on('close', () => {
+                        const latest = this.tunnels.get(port);
+                        if (!latest) {
+                            return;
+                        }
+                        latest.providerSocket = null;
+                        this.releaseTunnel(port, 'provider-disconnected');
+                    });
                 }
+
+                socket.on('error', () => {
+                    socket.destroy();
+                });
             }
         });
 
@@ -183,11 +343,148 @@ class RelayServer {
 
         this.tunnels.set(port, {
             server,
+            sessionId,
             providerId,
             deviceSerial,
             controllerSocket: null,
-            providerSocket: null
+            providerSocket: null,
+            halfOpenTimer: null,
+            idleTimer: null
         });
+
+        this.armHalfOpenTimeout(port);
+    }
+
+    releaseTunnel(port, reason = 'unknown') {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.halfOpenTimer) {
+            clearTimeout(tunnel.halfOpenTimer);
+            tunnel.halfOpenTimer = null;
+        }
+
+        if (tunnel.idleTimer) {
+            clearTimeout(tunnel.idleTimer);
+            tunnel.idleTimer = null;
+        }
+
+        if (tunnel.controllerSocket) {
+            tunnel.controllerSocket.end();
+        }
+
+        if (tunnel.providerSocket) {
+            tunnel.providerSocket.end();
+        }
+
+        tunnel.server.close();
+        this.portPool.release(port);
+        this.tunnels.delete(port);
+        this.releaseDeviceSession(tunnel.providerId, tunnel.deviceSerial, tunnel.sessionId);
+        this.sessionEvent('closed', {
+            sessionId: tunnel.sessionId,
+            providerId: tunnel.providerId,
+            deviceSerial: tunnel.deviceSerial,
+            relayPort: port,
+            reason
+        });
+
+        console.log(chalk.dim(`Released tunnel on port ${port} (${reason})`));
+    }
+
+    armHalfOpenTimeout(port) {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.halfOpenTimer) {
+            clearTimeout(tunnel.halfOpenTimer);
+        }
+
+        tunnel.halfOpenTimer = setTimeout(() => {
+            const latest = this.tunnels.get(port);
+            if (!latest) {
+                return;
+            }
+
+            const fullyConnected = latest.controllerSocket && latest.providerSocket;
+            if (!fullyConnected) {
+                this.releaseTunnel(port, 'half-open-timeout');
+            }
+        }, this.halfOpenTimeoutMs);
+    }
+
+    armIdleTimeout(port) {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.idleTimer) {
+            clearTimeout(tunnel.idleTimer);
+        }
+
+        tunnel.idleTimer = setTimeout(() => {
+            const latest = this.tunnels.get(port);
+            if (!latest) {
+                return;
+            }
+
+            const fullyConnected = latest.controllerSocket && latest.providerSocket;
+            if (fullyConnected) {
+                this.releaseTunnel(port, 'idle-timeout');
+            }
+        }, this.idleTimeoutMs);
+    }
+
+    bindIdleTracking(port, socket) {
+        socket.on('data', () => {
+            this.armIdleTimeout(port);
+        });
+    }
+
+    getDeviceKey(providerId, deviceSerial) {
+        return `${providerId}:${deviceSerial}`;
+    }
+
+    reserveDeviceSession(providerId, deviceSerial, sessionId) {
+        const deviceKey = this.getDeviceKey(providerId, deviceSerial);
+        const currentSession = this.activeDeviceSessions.get(deviceKey);
+
+        if (currentSession && currentSession !== sessionId) {
+            return false;
+        }
+
+        this.activeDeviceSessions.set(deviceKey, sessionId);
+        return true;
+    }
+
+    releaseDeviceSession(providerId, deviceSerial, sessionId) {
+        const deviceKey = this.getDeviceKey(providerId, deviceSerial);
+        const currentSession = this.activeDeviceSessions.get(deviceKey);
+
+        if (currentSession === sessionId) {
+            this.activeDeviceSessions.delete(deviceKey);
+        }
+    }
+
+    sendStatus(ws, msg = {}) {
+        const stats = this.portPool.getStats();
+        const telemetry = this.getObservabilitySnapshot();
+
+        ws.send(JSON.stringify({
+            type: 'status_response',
+            providers: this.providers.size,
+            tunnels: this.tunnels.size,
+            maxSessions: this.maxSessions,
+            availablePorts: stats.available,
+            allocatedPorts: stats.allocated,
+            telemetry,
+            requestId: msg.requestId || null
+        }));
     }
 
     handleDisconnect(ws) {
@@ -200,9 +497,7 @@ class RelayServer {
             // Clean up tunnels for this provider
             for (const [port, tunnel] of this.tunnels) {
                 if (tunnel.providerId === providerId) {
-                    tunnel.server.close();
-                    this.portPool.release(port);
-                    this.tunnels.delete(port);
+                    this.releaseTunnel(port, 'provider-ws-disconnect');
                 }
             }
         }

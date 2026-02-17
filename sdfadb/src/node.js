@@ -4,7 +4,7 @@
  */
 
 const { Provider } = require('./provider');
-const { Controller, connect } = require('./controller');
+const { connect, disconnect } = require('./controller');
 const chalk = require('chalk');
 
 class HybridNode {
@@ -13,7 +13,8 @@ class HybridNode {
         this.shareDevices = options.shareDevices || [];
         this.mounts = options.mounts || [];
         this.provider = null;
-        this.connections = new Map();
+        this.providerSessions = new Map();
+        this.controllerSessions = new Map();
     }
 
     async start() {
@@ -50,30 +51,51 @@ class HybridNode {
         this.provider.start().catch(err => {
             console.error(chalk.red('Provider error:'), err.message);
         });
+
+        this.providerSessions.set('local-provider', {
+            relay: this.relay,
+            sharedDevices: this.shareDevices,
+            startedAt: new Date().toISOString()
+        });
     }
 
     async mountDevice(mount) {
         console.log(chalk.cyan(`Mounting ${mount.device} from ${mount.provider} → localhost:${mount.port}`));
 
         try {
-            await connect({
+            const mounted = await connect({
                 relay: this.relay,
                 providerId: mount.provider,
                 deviceSerial: mount.device,
-                localPort: mount.port
+                localPort: Number.isInteger(mount.port) ? mount.port : undefined
             });
 
-            this.connections.set(mount.port, mount);
+            const localPort = mounted?.localPort || mount.port;
+            this.controllerSessions.set(localPort, {
+                ...mount,
+                localPort,
+                mountedAt: new Date().toISOString()
+            });
 
         } catch (error) {
             console.error(chalk.red(`Failed to mount ${mount.device}:`), error.message);
         }
     }
 
-    shutdown() {
-        // Close all connections
-        for (const [port, mount] of this.connections) {
-            console.log(chalk.dim(`Closing connection on port ${port}`));
+    async shutdown() {
+        // Close controller-side sessions
+        for (const [port] of this.controllerSessions) {
+            console.log(chalk.dim(`Closing controller session on port ${port}`));
+            try {
+                await disconnect({ port, all: false });
+            } catch {
+                // best effort
+            }
+        }
+
+        // Close provider-side session info (provider process follows main process exit)
+        for (const [key] of this.providerSessions) {
+            console.log(chalk.dim(`Stopping provider session ${key}`));
         }
     }
 }

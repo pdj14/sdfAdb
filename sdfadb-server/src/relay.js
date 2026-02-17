@@ -25,8 +25,15 @@ class RelayServer {
         this.providers = new Map();      // providerId -> { ws, devices }
         this.sessions = new Map();       // sessionId -> { port, providerId, deviceSerial, status }
         this.tunnels = new Map();        // port -> { server, providerSocket, clientSocket }
+        this.activeDeviceSessions = new Map(); // providerId:serial -> sessionId
 
         this.wss = null;
+        this.halfOpenTimeoutMs = options.halfOpenTimeoutMs || 15000;
+        this.idleTimeoutMs = options.idleTimeoutMs || 300000;
+        this.metrics = {
+            connectFailures: 0
+        };
+        this.maxSessions = options.maxSessions || 100;
     }
 
     start() {
@@ -87,7 +94,7 @@ class RelayServer {
                 break;
 
             case 'list_devices':
-                this.listDevices(ws);
+                this.listDevices(ws, msg);
                 break;
 
             case 'allocate_port':
@@ -98,12 +105,74 @@ class RelayServer {
                 this.connectDevice(ws, msg);
                 break;
 
+            case 'disconnect_device':
+                this.disconnectDevice(ws, msg);
+                break;
+
             case 'status':
-                this.sendStatus(ws);
+                this.sendStatus(ws, msg);
                 break;
 
             default:
                 console.log(chalk.dim(`Unknown message type: ${msg.type}`));
+        }
+    }
+
+    buildError(code, message, retryable = false) {
+        this.metrics.connectFailures += 1;
+        return {
+            success: false,
+            error: message,
+            errorCode: code,
+            retryable
+        };
+    }
+
+    sessionEvent(event, details = {}) {
+        console.log(chalk.dim(`[SESSION] ${event} ${JSON.stringify(details)}`));
+    }
+
+    getObservabilitySnapshot() {
+        let halfOpenSessions = 0;
+
+        for (const [, tunnel] of this.tunnels) {
+            const connectedCount = (tunnel.providerSocket ? 1 : 0) + (tunnel.clientSocket ? 1 : 0);
+            if (connectedCount < 2) {
+                halfOpenSessions += 1;
+            }
+        }
+
+        const stats = this.portPool.getStats();
+        return {
+            active_sessions: this.activeDeviceSessions.size,
+            half_open_sessions: halfOpenSessions,
+            port_pool_usage: stats.allocated,
+            connect_failures: this.metrics.connectFailures
+        };
+    }
+
+    getDeviceKey(providerId, deviceSerial) {
+        return `${providerId}:${deviceSerial}`;
+    }
+
+    reserveDeviceSession(providerId, deviceSerial, sessionId) {
+        const deviceKey = this.getDeviceKey(providerId, deviceSerial);
+        const currentSession = this.activeDeviceSessions.get(deviceKey);
+
+        if (currentSession && currentSession !== sessionId) {
+            return false;
+        }
+
+        this.activeDeviceSessions.set(deviceKey, sessionId);
+        return true;
+    }
+
+    releaseDeviceSession(providerId, deviceSerial, sessionId) {
+        const deviceKey = this.getDeviceKey(providerId, deviceSerial);
+        const currentSession = this.activeDeviceSessions.get(deviceKey);
+
+        if (currentSession === sessionId) {
+            this.activeDeviceSessions.delete(deviceKey);
         }
     }
 
@@ -128,7 +197,8 @@ class RelayServer {
         ws.send(JSON.stringify({
             type: 'registered',
             providerId,
-            status: 'ok'
+            status: 'ok',
+            requestId: msg.requestId || null
         }));
     }
 
@@ -148,7 +218,7 @@ class RelayServer {
     /**
      * List all available devices
      */
-    listDevices(ws) {
+    listDevices(ws, msg = {}) {
         const devices = [];
 
         for (const [providerId, provider] of this.providers) {
@@ -162,7 +232,8 @@ class RelayServer {
 
         ws.send(JSON.stringify({
             type: 'device_list',
-            devices
+            devices,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -185,8 +256,28 @@ class RelayServer {
         if (!port) {
             ws.send(JSON.stringify({
                 type: 'allocate_response',
-                success: false,
-                error: 'No ports available'
+                ...this.buildError('PORT_EXHAUSTED', 'No ports available', true),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
+        if (this.tunnels.size >= this.maxSessions) {
+            this.portPool.release(port);
+            ws.send(JSON.stringify({
+                type: 'allocate_response',
+                ...this.buildError('SESSION_LIMIT_REACHED', 'Max sessions reached', true),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
+        if (!this.reserveDeviceSession(providerId, deviceSerial, sessionId)) {
+            this.portPool.release(port);
+            ws.send(JSON.stringify({
+                type: 'allocate_response',
+                ...this.buildError('DEVICE_BUSY', 'Device already in use', false),
+                requestId: msg.requestId || null
             }));
             return;
         }
@@ -209,7 +300,8 @@ class RelayServer {
             success: true,
             sessionId,
             port,
-            host: this.host === '0.0.0.0' ? 'SERVER_IP' : this.host
+            host: this.host === '0.0.0.0' ? 'SERVER_IP' : this.host,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -223,11 +315,20 @@ class RelayServer {
         if (!provider) {
             ws.send(JSON.stringify({
                 type: 'connect_response',
-                success: false,
-                error: 'Provider not found'
+                ...this.buildError('PROVIDER_NOT_FOUND', 'Provider not found', false),
+                requestId: msg.requestId || null
             }));
             return;
         }
+        if (this.tunnels.size >= this.maxSessions) {
+            ws.send(JSON.stringify({
+                type: 'connect_response',
+                ...this.buildError('SESSION_LIMIT_REACHED', 'Max sessions reached', true),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
 
         // Allocate port
         const sessionId = `${controllerId}-${deviceSerial}-${Date.now()}`;
@@ -236,11 +337,21 @@ class RelayServer {
         if (!port) {
             ws.send(JSON.stringify({
                 type: 'connect_response',
-                success: false,
-                error: 'No ports available'
+                ...this.buildError('PORT_EXHAUSTED', 'No ports available', true),
+                requestId: msg.requestId || null
             }));
             return;
         }
+        if (!this.reserveDeviceSession(providerId, deviceSerial, sessionId)) {
+            this.portPool.release(port);
+            ws.send(JSON.stringify({
+                type: 'connect_response',
+                ...this.buildError('DEVICE_BUSY', 'Device already in use', false),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
 
         // Create tunnel server
         this.createTunnelServer(port, sessionId, providerId, deviceSerial);
@@ -263,12 +374,70 @@ class RelayServer {
             relayPort: port
         }));
 
+        this.sessionEvent('connect_allocated', { sessionId, providerId, deviceSerial, relayPort: port });
+
         // Respond to controller
         ws.send(JSON.stringify({
             type: 'connect_response',
             success: true,
             relayPort: port,
-            sessionId
+            sessionId,
+            requestId: msg.requestId || null
+        }));
+    }
+
+    /**
+     * Disconnect a previously created session
+     */
+    disconnectDevice(ws, msg) {
+        const { sessionId, relayPort } = msg;
+
+        let targetSessionId = sessionId;
+        let targetPort = relayPort;
+
+        if (!targetPort && targetSessionId && this.sessions.has(targetSessionId)) {
+            targetPort = this.sessions.get(targetSessionId).port;
+        }
+
+        if (!targetSessionId && targetPort && this.tunnels.has(targetPort)) {
+            targetSessionId = this.tunnels.get(targetPort).sessionId;
+        }
+
+        if (!targetPort || !this.tunnels.has(targetPort)) {
+            ws.send(JSON.stringify({
+                type: 'disconnect_response',
+                ...this.buildError('SESSION_NOT_FOUND', 'Session not found', false),
+                requestId: msg.requestId || null
+            }));
+            return;
+        }
+
+        const tunnel = this.tunnels.get(targetPort);
+
+        if (tunnel.providerSocket) {
+            tunnel.providerSocket.end();
+        }
+
+        if (tunnel.clientSocket) {
+            tunnel.clientSocket.end();
+        }
+
+        const provider = this.providers.get(tunnel.providerId);
+        if (provider && provider.ws && provider.ws.readyState === WebSocket.OPEN) {
+            provider.ws.send(JSON.stringify({
+                type: 'disconnect_request',
+                relayPort: targetPort
+            }));
+        }
+
+        this.releaseTunnel(targetPort, 'disconnect-request');
+
+        ws.send(JSON.stringify({
+            type: 'disconnect_response',
+            success: true,
+            sessionId: targetSessionId || tunnel.sessionId,
+            relayPort: targetPort,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -280,6 +449,8 @@ class RelayServer {
             server: null,
             providerSocket: null,
             clientSocket: null,
+            halfOpenTimer: null,
+            idleTimer: null,
             sessionId,
             providerId,
             deviceSerial
@@ -298,9 +469,7 @@ class RelayServer {
                 socket.on('close', () => {
                     console.log(chalk.yellow(`[TUNNEL:${port}] Provider disconnected`));
                     tunnel.providerSocket = null;
-                    if (tunnel.clientSocket) {
-                        tunnel.clientSocket.end();
-                    }
+                    this.releaseTunnel(port, 'provider-disconnected');
                 });
 
             } else if (!tunnel.clientSocket) {
@@ -313,10 +482,19 @@ class RelayServer {
                 tunnel.providerSocket.pipe(socket);
                 socket.pipe(tunnel.providerSocket);
 
+                if (tunnel.halfOpenTimer) {
+                    clearTimeout(tunnel.halfOpenTimer);
+                    tunnel.halfOpenTimer = null;
+                }
+
+                this.bindIdleTracking(port, tunnel.providerSocket);
+                this.bindIdleTracking(port, tunnel.clientSocket);
+                this.armIdleTimeout(port);
+
                 socket.on('close', () => {
                     console.log(chalk.yellow(`[TUNNEL:${port}] Client disconnected`));
                     tunnel.clientSocket = null;
-                    // Keep provider connected for next client
+                    this.releaseTunnel(port, 'client-disconnected');
                 });
 
             } else {
@@ -341,18 +519,118 @@ class RelayServer {
         this.tunnels.set(port, tunnel);
     }
 
+    armHalfOpenTimeout(port) {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.halfOpenTimer) {
+            clearTimeout(tunnel.halfOpenTimer);
+        }
+
+        tunnel.halfOpenTimer = setTimeout(() => {
+            const latest = this.tunnels.get(port);
+            if (!latest) {
+                return;
+            }
+
+            const fullyConnected = latest.providerSocket && latest.clientSocket;
+            if (!fullyConnected) {
+                this.releaseTunnel(port, 'half-open-timeout');
+            }
+        }, this.halfOpenTimeoutMs);
+    }
+
+    releaseTunnel(port, reason = 'unknown') {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.halfOpenTimer) {
+            clearTimeout(tunnel.halfOpenTimer);
+            tunnel.halfOpenTimer = null;
+        }
+
+        if (tunnel.idleTimer) {
+            clearTimeout(tunnel.idleTimer);
+            tunnel.idleTimer = null;
+        }
+
+        if (tunnel.providerSocket) {
+            tunnel.providerSocket.end();
+        }
+
+        if (tunnel.clientSocket) {
+            tunnel.clientSocket.end();
+        }
+
+        tunnel.server.close();
+        this.tunnels.delete(port);
+        this.portPool.release(port);
+
+        if (tunnel.sessionId) {
+            this.sessions.delete(tunnel.sessionId);
+        }
+
+        this.releaseDeviceSession(tunnel.providerId, tunnel.deviceSerial, tunnel.sessionId);
+        this.sessionEvent('closed', {
+            sessionId: tunnel.sessionId,
+            providerId: tunnel.providerId,
+            deviceSerial: tunnel.deviceSerial,
+            relayPort: port,
+            reason
+        });
+
+        console.log(chalk.dim(`[TUNNEL:${port}] Released (${reason})`));
+    }
+
+    armIdleTimeout(port) {
+        const tunnel = this.tunnels.get(port);
+        if (!tunnel) {
+            return;
+        }
+
+        if (tunnel.idleTimer) {
+            clearTimeout(tunnel.idleTimer);
+        }
+
+        tunnel.idleTimer = setTimeout(() => {
+            const latest = this.tunnels.get(port);
+            if (!latest) {
+                return;
+            }
+
+            const fullyConnected = latest.providerSocket && latest.clientSocket;
+            if (fullyConnected) {
+                this.releaseTunnel(port, 'idle-timeout');
+            }
+        }, this.idleTimeoutMs);
+    }
+
+    bindIdleTracking(port, socket) {
+        socket.on('data', () => {
+            this.armIdleTimeout(port);
+        });
+    }
+
     /**
      * Send server status
      */
-    sendStatus(ws) {
+    sendStatus(ws, msg = {}) {
         const stats = this.portPool.getStats();
+        const telemetry = this.getObservabilitySnapshot();
         ws.send(JSON.stringify({
             type: 'status_response',
             providers: this.providers.size,
             sessions: this.sessions.size,
             tunnels: this.tunnels.size,
+            maxSessions: this.maxSessions,
             availablePorts: stats.available,
-            allocatedPorts: stats.allocated
+            allocatedPorts: stats.allocated,
+            telemetry,
+            requestId: msg.requestId || null
         }));
     }
 
@@ -368,9 +646,7 @@ class RelayServer {
             // Clean up tunnels for this provider
             for (const [port, tunnel] of this.tunnels) {
                 if (tunnel.providerId === providerId) {
-                    tunnel.server.close();
-                    this.portPool.release(port);
-                    this.tunnels.delete(port);
+                    this.releaseTunnel(port, 'provider-ws-disconnect');
                 }
             }
         }
@@ -383,8 +659,8 @@ class RelayServer {
         console.log(chalk.yellow('\nShutting down...'));
 
         // Close all tunnels
-        for (const [port, tunnel] of this.tunnels) {
-            tunnel.server.close();
+        for (const [port] of this.tunnels) {
+            this.releaseTunnel(port, 'server-shutdown');
         }
 
         // Close WebSocket server
