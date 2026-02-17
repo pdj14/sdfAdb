@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 21120,
+  "portStart": 30001,
+  "portEnd": 30999,
+  "halfOpenTimeoutMs": 15000,
+  "idleTimeoutMs": 300000,
+  "maxSessions": 100
+}

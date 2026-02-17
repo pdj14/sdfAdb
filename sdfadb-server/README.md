@@ -9,6 +9,10 @@ Ubuntu에서 동작하는 ADB Remote Bridge Relay 서버입니다.
 - 🌉 Provider ↔ Client TCP 브릿지
 - 📊 세션 및 상태 관리
 
+## 요구사항
+
+- Node.js 20+
+
 ## 설치
 
 ```bash
@@ -141,3 +145,9 @@ sudo systemctl start sdfadb-server
 ## 라이선스
 
 MIT License
+
+
+## Relay 설정 템플릿
+
+- 기본 템플릿: `config.relay.example.json`
+- 실행 예시: `sdfadb-server start --config ./config.relay.example.json`
